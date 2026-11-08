@@ -978,18 +978,39 @@ func TestConvertGeminiResponseToOpenAIResponses_VisibleSignatureCompletesActiveR
 		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"visible answer","thoughtSignature":"` + testResponsesGeminiThoughtSignature + `"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":3,"totalTokenCount":15},"modelVersion":"gemini-3.6-flash","responseId":"resp_active_reasoning"}}`,
 	}
 	var param any
-	var out [][]byte
+	chunks := make([][]byte, 0, len(in))
 	for _, line := range in {
-		out = append(out, ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param)...)
+		chunks = append(chunks, ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param)...)
 	}
-	var doneTypes []string
-	var addedID, addedSignature, doneID, doneSignature string
-	for _, chunk := range out {
+
+	firstSummary := make([]string, 0)
+	firstRaw := make([]string, 0)
+	var addedID, addedSignature string
+	for _, chunk := range chunks {
 		event, data := parseSSEEvent(t, chunk)
-		if event == "response.output_item.added" && data.Get("item.type").String() == "reasoning" {
-			addedID = data.Get("item.id").String()
-			addedSignature = data.Get("item.encrypted_content").String()
+		switch event {
+		case "response.output_item.added":
+			if data.Get("item.type").String() == "reasoning" {
+				addedID = data.Get("item.id").String()
+				addedSignature = data.Get("item.encrypted_content").String()
+			}
+		case "response.reasoning_summary_text.delta":
+			firstSummary = append(firstSummary, data.Get("delta").String())
+		case "response.reasoning_text.delta":
+			firstRaw = append(firstRaw, data.Get("delta").String())
 		}
+	}
+	if got := strings.Join(firstSummary, ""); got != "hidden thought" || got != strings.Join(firstRaw, "") {
+		t.Fatalf("first unsigned thought chunk deltas: summary=%q raw=%q", got, firstRaw)
+	}
+	if addedID == "" || addedSignature != "" {
+		t.Fatalf("first unsigned thought chunk did not open empty reasoning item: id=%q signature=%q", addedID, addedSignature)
+	}
+
+	var doneTypes []string
+	var doneID, doneSignature string
+	for _, chunk := range chunks {
+		event, data := parseSSEEvent(t, chunk)
 		if event != "response.output_item.done" {
 			continue
 		}
@@ -1002,7 +1023,7 @@ func TestConvertGeminiResponseToOpenAIResponses_VisibleSignatureCompletesActiveR
 	if got := strings.Join(doneTypes, ","); got != "reasoning,message" {
 		t.Fatalf("done item order = %q, want reasoning,message", got)
 	}
-	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, addedSignature) != testResponsesGeminiThoughtSignature || doneSignature != addedSignature {
+	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, doneSignature) != testResponsesGeminiThoughtSignature {
 		t.Fatalf("reasoning item changed between added and done: added=(%q,%q) done=(%q,%q)", addedID, addedSignature, doneID, doneSignature)
 	}
 }
@@ -1034,15 +1055,15 @@ func TestConvertGeminiResponseToOpenAIResponses_LateThoughtSignatureIsImmutable(
 			}
 		}
 	}
-	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, addedSignature) != signature || doneSignature != addedSignature || doneText != "onetwo" {
+	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, doneSignature) != signature || doneText != "onetwo" {
 		t.Fatalf("late thought signature replay malformed: added=(%q,%q) done=(%q,%q,%q)", addedID, addedSignature, doneID, doneSignature, doneText)
 	}
 }
 
 func TestConvertGeminiResponseToOpenAIResponses_DoneFinalizesStartedStreamExactlyOnce(t *testing.T) {
 	var param any
-	ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"unsigned thought","thought":true}]}}],"responseId":"done-finalize"}}`), &param)
-	out := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte("[DONE]"), &param)
+	out := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"unsigned thought","thought":true}]}}],"responseId":"done-finalize"}}`), &param)
+	out = append(out, ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte("[DONE]"), &param)...)
 
 	var deltas []string
 	outputDoneCount := 0
